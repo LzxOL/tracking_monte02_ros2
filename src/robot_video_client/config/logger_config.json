@@ -1,0 +1,19 @@
+{
+  "log": {
+    "console": {
+      "enable": true,
+      "level": 2
+    },
+    "file": {
+      "enable": true,
+      "rollType": 0,
+      "level": 2,
+      "immediaFlush": true,
+      "buffSize": 1000000,
+      "filePath": "log",
+      "fileName": "",
+      "MaxBackupIndex": 2,
+      "MaxFileSize": 5242880
+    }
+  }
+}

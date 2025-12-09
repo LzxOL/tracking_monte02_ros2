@@ -1,0 +1,17 @@
+# colcon/ROS2 编译产物
+/build/
+/install/
+/log/
+# Python 缓存
+pycache/
+.pyc
+.pyo
+.pyd
+# 常见编辑器文件
+.vscode/
+.idea/
+.DS_Store
+# 只排除这个 checkpoint 文件
+/src/track_on/checkpoints/track_on_checkpoint.pt
+# 如希望排除该目录内所有 .pt，可用（可选，二选一）
+# /src/track_on/checkpoints/.pt
