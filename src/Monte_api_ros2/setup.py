@@ -11,6 +11,8 @@ setup(
     data_files=[
         ('share/ament_index/resource_index/packages', ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
+        (os.path.join('share', package_name, 'launch'), glob('launch/*.launch.py')),
+        (os.path.join('share', package_name, 'lib'), glob('lib/*')),
     ],
     install_requires=['setuptools', 'rclpy', 'tf2_ros'],
     zip_safe=True,
@@ -22,6 +24,9 @@ setup(
     entry_points={
         'console_scripts': [
             'head_base_tf_node=Monte_api.head_base_tf_node:main',
+            'arm_control_node=Monte_api.control_node:main',
+            'points3d_tf_to_arm_base_node=Monte_api.points3d_tf_to_arm_base_node:main',
+            'points3d_test_publisher=Monte_api.points3d_test_publisher:main',
         ],
     },
 )

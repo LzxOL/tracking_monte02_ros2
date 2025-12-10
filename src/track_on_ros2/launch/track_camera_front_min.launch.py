@@ -13,7 +13,7 @@ def generate_launch_description():
         description='TrackOn 模型检查点（ckp）路径')
 
     camera_topic_arg = DeclareLaunchArgument(
-        'camera_topic', default_value='/left/color/video',
+        'camera_topic', default_value='/right/color/video',
         description='前端摄像头颜色图像话题')
 
     publish_visualization_arg = DeclareLaunchArgument(

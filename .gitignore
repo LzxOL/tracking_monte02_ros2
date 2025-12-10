@@ -2,6 +2,7 @@
 /build/
 /install/
 /log/
+/Log/
 # Python 缓存
 pycache/
 .pyc

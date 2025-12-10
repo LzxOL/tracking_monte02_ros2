@@ -18,7 +18,8 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from cv_bridge import CvBridge
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import Image, PointCloud, ChannelFloat32
+from geometry_msgs.msg import Point32
 from std_msgs.msg import Header
 import matplotlib.pyplot as plt
 import re
@@ -80,13 +81,14 @@ class TrackCameraFrontMinNode(Node):
 
         ######## 参数 ########
         self.declare_parameter('checkpoint_path', '')
-        self.declare_parameter('camera_topic', '/left/color/video')
+        self.declare_parameter('camera_topic', '')
         self.declare_parameter('publish_visualization', True)
         self.declare_parameter('show_interactive_window', True)
 
         # 3D 相关
-        self.declare_parameter('intrinsics_file', '/home/root1/Corenetic/code/project/tracking_with_cameara_ws/camera_lhead_front_intrinsics.txt')
-        self.declare_parameter('depth_topic', '/left/depth/stream')
+        # 默认从指定文件读取相机内参（像素单位）
+        self.declare_parameter('intrinsics_file', '/home/root1/Corenetic/code/project/tracking_with_cameara_ws/camera_rhead_front_intrinsics_02_10.txt')
+        self.declare_parameter('depth_topic', '/right/depth/stream')
         self.declare_parameter('depth_scale', 0.001)
         self.declare_parameter('print_3d', True)
         self.declare_parameter('print_3d_interval', 1)
@@ -190,6 +192,8 @@ class TrackCameraFrontMinNode(Node):
             raise
 
         self.keypoints_pub = self.create_publisher(self.Keypoints, "tracking/keypoints", 10)
+        # 3D点云发布（PointCloud）
+        self.pc_pub = self.create_publisher(PointCloud, "tracking/points3d", 10)
 
         self.get_logger().info("前端摄像头跟踪节点已启动（含 JSON 3D 打印）")
     ############################################
@@ -235,6 +239,7 @@ class TrackCameraFrontMinNode(Node):
                     self.first_frame_captured = True
                     self.publish_keypoints(points, visibility, header)
                     self._compute_and_log_3d(points, visibility)
+                    self._publish_points3d(points, visibility, header)
                 except Exception as e:
                     self.get_logger().error(f"初始化跟踪失败: {e}")
                     return
@@ -269,6 +274,8 @@ class TrackCameraFrontMinNode(Node):
 
             # 打印3D坐标（文本）
             self._compute_and_log_3d(points, visibility)
+            # 发布3D点云
+            self._publish_points3d(points, visibility, header)
 
             self.frame_count += 1
 
@@ -523,6 +530,61 @@ class TrackCameraFrontMinNode(Node):
             self.get_logger().info(f"内参: fx={self.fx:.2f}, fy={self.fy:.2f}, cx={self.cx:.2f}, cy={self.cy:.2f}")
 
     ############################################
+    # 发布3D点云
+    ############################################
+    def _publish_points3d(self, points, visibility, header):
+        # 内参或深度未就绪则不发布
+        if any(v is None for v in [self.fx, self.fy, self.cx, self.cy]) or self.latest_depth is None:
+            return
+        try:
+            pc = PointCloud()
+            pc.header = Header()
+            pc.header.stamp = header.stamp
+            pc.header.frame_id = "right_camera_color_optical_frame"
+
+            pts = []
+            ids = []
+            us = []
+            vs = []
+            visibles = []
+
+            n = len(points)
+            for i in range(n):
+                vis = bool(visibility[i])
+                u = float(points[i, 0])
+                v = float(points[i, 1])
+                if not vis:
+                    # 不可见点跳过（也可改为填充 NaN）
+                    continue
+                Z = self._depth_at(u, v, ksize=5)
+                if Z is None or Z <= 0:
+                    continue
+                X = (u - self.cx) / self.fx * Z
+                Y = (v - self.cy) / self.fy * Z
+                p = Point32()
+                p.x = float(X)
+                p.y = float(Y)
+                p.z = float(Z)
+                pts.append(p)
+                ids.append(float(i))
+                us.append(u)
+                vs.append(v)
+                visibles.append(1.0)
+
+            pc.points = pts
+
+            # 附加通道：id、u、v、visible
+            ch_id = ChannelFloat32(name='id', values=ids)
+            ch_u = ChannelFloat32(name='u', values=us)
+            ch_v = ChannelFloat32(name='v', values=vs)
+            ch_vis = ChannelFloat32(name='visible', values=visibles)
+            pc.channels = [ch_id, ch_u, ch_v, ch_vis]
+
+            self.pc_pub.publish(pc)
+        except Exception as e:
+            self.get_logger().warn(f"发布3D点云失败: {e}")
+
+    ############################################
     # 深度图回调
     ############################################
     def depth_callback(self, msg: Image):
@@ -573,12 +635,50 @@ class TrackCameraFrontMinNode(Node):
     # 加载相机内参
     ############################################
     def _load_intrinsics(self, path):
-        lines = open(path).read().splitlines()
-        nums = [float(x) for x in re.findall(r"[-+]?\d*\.\d+|[-+]?\d+", "\n".join(lines))]
-        if len(nums) >= 9:
-            fx, _, cx, _, fy, cy, *_ = nums
-            return fx, fy, cx, cy
-        raise RuntimeError("相机内参文件格式不正确")
+        """
+        从文本文件中解析 3x3 K 矩阵（像素单位）。
+        期望格式：
+        K:
+        fx 0 cx
+        0 fy cy
+        0 0 1
+        允许有注释与其它文本，将只解析 K: 后面的三行。
+        """
+        with open(path, 'r') as f:
+            lines = [ln.strip() for ln in f.readlines() if ln.strip()]
+        # 找到 'K:' 行
+        k_idx = -1
+        for i, ln in enumerate(lines):
+            if ln.startswith('K'):
+                # 允许 'K:' 或 'K :' 等
+                if ln.replace(' ', '').startswith('K:'):
+                    k_idx = i
+                    break
+        if k_idx == -1 or k_idx + 3 >= len(lines):
+            # fallback：旧的正则方式，但限定只取前三行数字
+            nums = []
+            for ln in lines:
+                if ln.startswith('#'):
+                    continue
+                nums.extend([float(x) for x in re.findall(r"[-+]?\d*\.\d+|[-+]?\d+", ln)])
+                if len(nums) >= 9:
+                    break
+            if len(nums) >= 9:
+                fx, _, cx, _, fy, cy, *_ = nums
+                return fx, fy, cx, cy
+            raise RuntimeError('相机内参文件格式不正确，未找到 K: 3 行')
+        # 解析 K: 后三行
+        k_rows = []
+        for ln in lines[k_idx+1:k_idx+4]:
+            vals = [float(x) for x in ln.replace(',', ' ').split() if re.match(r"[-+]?\d*\.\d+|[-+]?\d+", x)]
+            if len(vals) != 3:
+                raise RuntimeError('K 矩阵每行应有 3 个数')
+            k_rows.append(vals)
+        fx = k_rows[0][0]
+        cx = k_rows[0][2]
+        fy = k_rows[1][1]
+        cy = k_rows[1][2]
+        return fx, fy, cx, cy
 
 ############################################
 # 主入口

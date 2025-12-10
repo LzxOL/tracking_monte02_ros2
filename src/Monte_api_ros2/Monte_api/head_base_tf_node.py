@@ -7,7 +7,7 @@ from geometry_msgs.msg import TransformStamped
 from tf2_ros import TransformBroadcaster
 
 """
-   运行 ros2 run head_base_tf head_base_tf_node
+   运行: ros2 run Monte_api_ros2 head_base_tf_node
 """
 
 class HeadBaseTFNode(Node):
@@ -20,10 +20,10 @@ class HeadBaseTFNode(Node):
         super().__init__('head_base_tf_node')
 
         # 参数
-        self.declare_parameter('robot_ip', '192.168.23.168:50051')
+        self.declare_parameter('robot_ip', '192.168.22.63:50051')
         self.declare_parameter('robot_lib_path', '/home/root1/Corenetic/code/project/tracking_with_cameara_ws/src/Monte_api_ros2/lib')
-        self.declare_parameter('parent_frame', 'link_t0_base')
-        self.declare_parameter('child_frame', 'link_h2_head')
+        self.declare_parameter('parent_frame', 'link_l0_arm_base')
+        self.declare_parameter('child_frame', 'left_camera_color_optical_frame')
         self.declare_parameter('rate', 2.0)  # Hz
 
         robot_ip = self.get_parameter('robot_ip').value
