@@ -3,50 +3,10 @@ import sys
 import math
 import time
 import numpy as np
-import threading
-import select
-import termios
-import tty
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import PointCloud
 from geometry_msgs.msg import Point32
-
-# ACT 推理相关导入（可选，如果不可用则禁用 ACT 功能）
-try:
-    import torch
-    import einops
-    import cv2
-    from pathlib import Path
-    import hydra
-    
-    # 添加项目路径
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-    project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(current_dir))))
-    if project_root not in sys.path:
-        sys.path.insert(0, project_root)
-    
-    teleop_src = os.path.join(os.path.dirname(project_root), "teleoperation/src")
-    if teleop_src not in sys.path and os.path.exists(teleop_src):
-        sys.path.insert(0, teleop_src)
-    
-    from lerobot.common.policies.act.configuration_act import ACTConfig
-    from lerobot.common.policies.act.modeling_act import ACTPolicy
-    from corenetic_teleoperation.robot.teleop_robot import TeleopRobot
-    from corenetic_teleoperation.utils.robot_obs import ImageObs
-    
-    try:
-        from track_on_ros2_msgs.msg import Keypoints
-        KEYPOINTS_AVAILABLE = True
-    except (ImportError, AttributeError):
-        KEYPOINTS_AVAILABLE = False
-        Keypoints = None
-    
-    ACT_AVAILABLE = True
-except ImportError as e:
-    ACT_AVAILABLE = False
-    print(f"Warning: ACT dependencies not available: {e}")
-    print("ACT inference will be disabled.")
 
 
 def _ensure_robotlib_visible(robot_lib_path: str):
@@ -138,42 +98,6 @@ def invert_rt(R: np.ndarray, t: np.ndarray):
     return Rt, tinv
 
 
-# ==================== ACT 推理辅助函数 ====================
-if ACT_AVAILABLE:
-    def prepare_image_for_inference(image: np.ndarray, target_size: tuple = (480, 480)) -> torch.Tensor:
-        """准备推理用的图像,格式与训练时一致"""
-        if image.shape[:2] != target_size:
-            image = cv2.resize(image, target_size, interpolation=cv2.INTER_LINEAR)
-        
-        if image.dtype != np.uint8:
-            if image.max() <= 1.0:
-                image = (image * 255.0).astype(np.uint8)
-            else:
-                image = image.astype(np.uint8)
-        
-        if len(image.shape) == 3:
-            image = image[np.newaxis, ...]
-        
-        img = torch.from_numpy(image)
-        assert img.dtype == torch.uint8, f"expect torch.uint8, but instead {img.dtype=}"
-        img = einops.rearrange(img, "b h w c -> b c h w").contiguous()
-        img = img.type(torch.float32) / 255.0
-        return img.squeeze(0)
-    
-    def load_act_model(checkpoint_path: str, device: str = "cuda:0"):
-        """加载 ACT 模型"""
-        checkpoint_path = Path(checkpoint_path)
-        device = torch.device(device)
-        
-        cfg = ACTConfig.from_pretrained(checkpoint_path)
-        policy = ACTPolicy.from_pretrained(checkpoint_path, config=cfg, map_location=str(device))
-        policy.eval()
-        policy.to(device)
-        policy.reset()
-        
-        return policy
-
-
 class Points3DTFToArmBaseNode(Node):
     """
     订阅 tracking/points3d (sensor_msgs/PointCloud)，
@@ -212,20 +136,18 @@ class Points3DTFToArmBaseNode(Node):
         self.declare_parameter('max_acc', 0.50)       # m/s^2
         self.declare_parameter('use_wait', False)     # set_arm_position 的 wait
         self.declare_parameter('target_id', -1)       # 若>=0，则优先匹配channel 'id'
-        # ACT 推理参数
-        self.declare_parameter('enable_act_inference', ACT_AVAILABLE)  # 是否启用 ACT 推理
-        if ACT_AVAILABLE:
-            current_dir = os.path.dirname(os.path.abspath(__file__))
-            project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(current_dir))))
-            default_checkpoint = os.path.join(
-                project_root,
-                "outputs/train/monte02_insert_needle_act_10d_input/checkpoints/005000/pretrained_model"
-            )
-        else:
-            default_checkpoint = ""
-        self.declare_parameter('act_checkpoint_path', default_checkpoint)
-        self.declare_parameter('act_device', 'cuda:0')
-        self.declare_parameter('act_data_len', 500)  # ACT 推理循环次数
+        # 粗定位前：末端左右转（关节角）预调整
+        self.declare_parameter('servo_yaw_enabled', True)
+        self.declare_parameter('servo_yaw_gain', 0.8)          # rad/m，基于基座系y偏差
+        self.declare_parameter('servo_yaw_max', 0.35)          # rad，单次最大偏航
+        self.declare_parameter('servo_cmd_interval', 0.5)      # s，最小发送间隔
+        self.declare_parameter('servo_speed', 0.1)             # set_arm_servo_angle 的 speed
+        self.declare_parameter('servo_acc', 1.0)               # set_arm_servo_angle 的 acc
+        self.declare_parameter(
+            'servo_base_positions',
+            [-0.6544687747955322, 0.1876031905412674, -0.01836462691426277,
+             1.8717538118362427, 0.16210661828517914, 0.45163217186927795, -0.23318371176719666]
+        )
         # 外参文件 + 方向 + 坐标系约定
         self.declare_parameter('wrist_extrinsic_file', '/home/root1/Corenetic/code/project/tracking_with_cameara_ws/joint_r7_wrist_roll.txt')
         self.declare_parameter('invert_extrinsic', False)  # 若文件给的是 T_{source<-wrist}，则置 True 取逆
@@ -297,56 +219,19 @@ class Points3DTFToArmBaseNode(Node):
         self.max_acc = float(self.get_parameter('max_acc').value)
         self.use_wait = bool(self.get_parameter('use_wait').value)
         self.target_id = int(self.get_parameter('target_id').value)
+        self.servo_yaw_enabled = bool(self.get_parameter('servo_yaw_enabled').value)
+        self.servo_yaw_gain = float(self.get_parameter('servo_yaw_gain').value)
+        self.servo_yaw_max = float(self.get_parameter('servo_yaw_max').value)
+        self.servo_cmd_interval = float(self.get_parameter('servo_cmd_interval').value)
+        self.servo_speed = float(self.get_parameter('servo_speed').value)
+        self.servo_acc = float(self.get_parameter('servo_acc').value)
+        self.servo_base_positions = list(self.get_parameter('servo_base_positions').value)
 
         # 最新目标点（Base系）与平滑缓存
         self.target_point = None
         self.last_cmd_ts = 0.0
         self.cached_quat_wxyz = None  # 保持当前姿态
-        
-        # ACT 推理相关状态
-        self.coarse_positioning_complete = False  # 粗定位是否完成
-        self.act_inference_active = False  # ACT 推理是否正在进行
-        self.act_policy = None
-        self.act_robot_interface = None
-        self.act_image_obs = None
-        self.act_keypoint_sub = None
-        self.keyboard_thread = None
-        self.space_pressed = False
-        self.latest_keypoints_msg = None
-        self.keypoints_lock = threading.Lock()
-        
-        # 读取 ACT 参数
-        self.enable_act = bool(self.get_parameter('enable_act_inference').value) and ACT_AVAILABLE
-        if self.enable_act:
-            act_checkpoint = self.get_parameter('act_checkpoint_path').value
-            act_device = self.get_parameter('act_device').value
-            self.act_data_len = int(self.get_parameter('act_data_len').value)
-            
-            # 初始化 ACT 模型
-            try:
-                self.get_logger().info(f"加载 ACT 模型: {act_checkpoint}")
-                self.act_policy = load_act_model(act_checkpoint, act_device)
-                self.get_logger().info("ACT 模型加载成功")
-            except Exception as e:
-                self.get_logger().error(f"ACT 模型加载失败: {e}")
-                self.enable_act = False
-        
-        # 初始化关键点订阅（如果启用 ACT）
-        if self.enable_act and KEYPOINTS_AVAILABLE:
-            try:
-                from track_on_ros2_msgs.msg import Keypoints
-                self.act_keypoint_sub = self.create_subscription(
-                    Keypoints, '/tracking/keypoints', self._keypoint_callback, 10
-                )
-                self.get_logger().info("关键点订阅已创建: /tracking/keypoints")
-            except Exception as e:
-                self.get_logger().warn(f"关键点订阅创建失败: {e}")
-        
-        # 启动键盘监听线程（如果启用 ACT）
-        if self.enable_act:
-            self.keyboard_thread = threading.Thread(target=self._keyboard_listener, daemon=True)
-            self.keyboard_thread.start()
-            self.get_logger().info("键盘监听已启动（按空格键执行 ACT 推理）")
+        self.last_servo_cmd_ts = 0.0
 
         if self.enable_coarse_move:
             self.timer_ctrl = self.create_timer(0.05, self.control_loop)  # 20Hz
@@ -485,6 +370,9 @@ class Points3DTFToArmBaseNode(Node):
             # <<<
 
             self.target_point = valid_target
+            # 在进入粗定位前，先做基于末端关节的左右旋转微调（绕URDF Z）
+            if self.servo_yaw_enabled and valid_target is not None:
+                self._run_servo_yaw_adjust(valid_target)
 
     # ------------------- 末端粗定位控制（基于 set_arm_position） -------------------
     def _get_arm_position(self):
@@ -503,11 +391,35 @@ class Points3DTFToArmBaseNode(Node):
     def _build_pose_wxyz(self, p_xyz, quat_wxyz):
         return [float(p_xyz[0]), float(p_xyz[1]), float(p_xyz[2]), float(quat_wxyz[0]), float(quat_wxyz[1]), float(quat_wxyz[2]), float(quat_wxyz[3])]
 
+    def _run_servo_yaw_adjust(self, target_base: np.ndarray):
+        """
+        基于基座系目标点 y 偏差，调用 set_arm_servo_angle 调整末端最后关节水平左右转。
+        正值让相机向右，负值向左。
+        """
+        now = time.time()
+        if (now - self.last_servo_cmd_ts) < self.servo_cmd_interval:
+            return
+        if not hasattr(self, 'servo_base_positions') or len(self.servo_base_positions) < 7:
+            self.get_logger().warn('servo_base_positions 长度不足，跳过servo调整')
+            return
+        try:
+            dy = float(target_base[1])
+        except Exception:
+            return
+
+        positions = list(self.servo_base_positions)
+        delta_yaw = -self.servo_yaw_gain * dy  # 目标在左( +y )则朝左转(负)，在右则朝右转(正)
+        delta_yaw = float(np.clip(delta_yaw, -self.servo_yaw_max, self.servo_yaw_max))
+        positions[-1] = positions[-1] + delta_yaw
+
+        try:
+            self.robot.set_arm_servo_angle(self.component_type, positions, float(self.servo_speed), float(self.servo_acc), True)
+            self.last_servo_cmd_ts = now
+            self.get_logger().info(f'[servo yaw] dy={dy:.3f}, delta={delta_yaw:.3f}, cmd sent')
+        except Exception as e:
+            self.get_logger().warn(f'set_arm_servo_angle 失败: {e}')
+
     def control_loop(self):
-        # 检查是否需要运行 ACT 推理
-        if self.enable_act:
-            self._check_and_run_act()
-        
         if not self.enable_coarse_move or self.robot is None:
             return
         if self.target_point is None:
@@ -533,13 +445,6 @@ class Points3DTFToArmBaseNode(Node):
 
         # 到达阈值则不再发送
         if d <= self.distance_stop:
-            # 粗定位完成，标记状态
-            if not self.coarse_positioning_complete:
-                self.coarse_positioning_complete = True
-                if self.enable_act:
-                    self.get_logger().info("=" * 60)
-                    self.get_logger().info("粗定位完成！按下空格键执行 ACT 推理")
-                    self.get_logger().info("=" * 60)
             return
 
         # 计算一步目标（不越过阈值）
@@ -578,248 +483,6 @@ class Points3DTFToArmBaseNode(Node):
             if self._move_fail_count >= self._max_fail_count:
                 self.get_logger().error(f'❌ 粗定位连续失败 {self._max_fail_count} 次，暂停控制')
                 self.enable_coarse_move = False  # 自动关闭
-
-    # ==================== ACT 推理相关方法 ====================
-    def _keyboard_listener(self):
-        """键盘监听线程：检测空格键按下"""
-        if not ACT_AVAILABLE or not self.enable_act:
-            return
-        
-        # 检查 stdin 是否可用
-        if not sys.stdin.isatty():
-            self.get_logger().warn("stdin 不可用，键盘监听已禁用。可通过设置参数 'trigger_act' 为 true 来触发 ACT 推理")
-            return
-        
-        # 设置终端为非阻塞模式
-        fd = None
-        old_settings = None
-        try:
-            fd = sys.stdin.fileno()
-            old_settings = termios.tcgetattr(fd)
-            tty.setraw(sys.stdin.fileno())
-            
-            while rclpy.ok():
-                if select.select([sys.stdin], [], [], 0.1)[0]:
-                    char = sys.stdin.read(1)
-                    if char == ' ':  # 空格键
-                        if self.coarse_positioning_complete and not self.act_inference_active:
-                            self.space_pressed = True
-                            self.get_logger().info("检测到空格键，开始 ACT 推理...")
-                time.sleep(0.01)
-        except Exception as e:
-            self.get_logger().warn(f"键盘监听异常: {e}")
-        finally:
-            if fd is not None and old_settings is not None:
-                try:
-                    termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-                except:
-                    pass
-
-    def _run_act_inference(self):
-        """执行 ACT 推理循环"""
-        if not ACT_AVAILABLE or self.act_policy is None:
-            self.get_logger().error("ACT 不可用或模型未加载")
-            return
-        
-        if self.act_inference_active:
-            self.get_logger().warn("ACT 推理已在运行中")
-            return
-        
-        self.act_inference_active = True
-        self.get_logger().info("=" * 60)
-        self.get_logger().info("开始 ACT 推理循环")
-        self.get_logger().info("=" * 60)
-        
-        try:
-            # 初始化机器人接口和图像观测
-            current_dir = os.path.dirname(os.path.abspath(__file__))
-            project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(current_dir))))
-            config_abs_path = os.path.join(project_root, "corenetic_teleoperation", "infer_need")
-            
-            if not os.path.exists(config_abs_path):
-                raise FileNotFoundError(f"配置文件目录不存在: {config_abs_path}")
-            
-            original_cwd = os.getcwd()
-            os.chdir(project_root)
-            
-            try:
-                infer_need_path = os.path.join(project_root, "corenetic_teleoperation", "infer_need")
-                robot_link = os.path.join(infer_need_path, "robot")
-                if not os.path.exists(robot_link):
-                    try:
-                        target = os.path.join("..", "configs", "robot")
-                        os.symlink(target, robot_link)
-                    except Exception:
-                        pass
-                
-                hydra.initialize_config_dir(config_dir=infer_need_path, version_base="1.3")
-                config = hydra.compose(config_name="config.yaml")
-                teleop_config = hydra.compose(config_name="teleoperation_config.yaml")
-            finally:
-                os.chdir(original_cwd)
-            
-            self.act_robot_interface = TeleopRobot(config)
-            self.act_image_obs = ImageObs(**teleop_config.image_obs)
-            
-            # 获取设备
-            device = self.get_parameter('act_device').value
-            
-            # 初始化变量
-            first_frame_captured = False
-            head_init_img = None
-            left_init_img = None
-            
-            # 推理循环
-            with torch.no_grad():
-                for i in range(self.act_data_len):
-                    if not rclpy.ok():
-                        break
-                    
-                    time1 = time.time()
-                    
-                    # 获取机器人状态
-                    robot_states = {}
-                    try:
-                        js = self.act_robot_interface.get_joint_positions("left")
-                        if js is not None:
-                            robot_states["left_jpos"] = np.array(js) if not isinstance(js, np.ndarray) else js
-                        else:
-                            robot_states["left_jpos"] = np.zeros(7)
-                    except Exception as e_js:
-                        self.get_logger().warn(f"get_joint_positions fail: {e_js}")
-                        robot_states["left_jpos"] = np.zeros(7)
-                    
-                    try:
-                        gp_result = self.act_robot_interface.robot.get_gripper_position(1)
-                        if gp_result is None:
-                            robot_states["gripper_position"] = 0.0
-                        elif isinstance(gp_result, tuple):
-                            robot_states["gripper_position"] = float(gp_result[1]) if len(gp_result) >= 2 else 0.0
-                        else:
-                            robot_states["gripper_position"] = float(gp_result)
-                    except Exception as e_gp:
-                        self.get_logger().warn(f"get_gripper_position fail: {e_gp}")
-                        robot_states["gripper_position"] = 0.0
-                    
-                    # 获取图像数据
-                    image_states = self.act_image_obs.get_all_data_with_metadata()
-                    head_rgb_img_raw = image_states['head_rgb_img']
-                    left_rgb_img_raw = image_states['left_rgb_img']
-                    
-                    # 获取关键点
-                    keypoints = None
-                    if self.latest_keypoints_msg is not None:
-                        with self.keypoints_lock:
-                            if self.latest_keypoints_msg is not None:
-                                kps = sorted(self.latest_keypoints_msg.keypoints, key=lambda k: k.id)
-                                keypoints = np.array([[k.x, k.y] for k in kps], dtype=np.float32)
-                    
-                    # 预处理图像
-                    head_rgb_img = prepare_image_for_inference(head_rgb_img_raw).unsqueeze(0).to(device, non_blocking=True)
-                    left_rgb_img = prepare_image_for_inference(left_rgb_img_raw).unsqueeze(0).to(device, non_blocking=True)
-                    
-                    # 捕获第一帧作为初始图像
-                    if not first_frame_captured:
-                        head_init_img = head_rgb_img.clone()
-                        left_init_img = left_rgb_img.clone()
-                        first_frame_captured = True
-                    
-                    # 准备状态：8维（7关节 + 1gripper）
-                    left_jpos_arr = robot_states.get('left_jpos', np.zeros(7))
-                    if not isinstance(left_jpos_arr, np.ndarray) or left_jpos_arr.size != 7:
-                        left_jpos_arr = np.zeros(7)
-                    
-                    gripper_pos_val = float(robot_states.get('gripper_position', 0.0))
-                    
-                    left_arm_pose = torch.as_tensor(left_jpos_arr, dtype=torch.float32).reshape(-1)
-                    gripper_pos = torch.as_tensor([gripper_pos_val], dtype=torch.float32).reshape(-1)
-                    state = torch.cat([left_arm_pose, gripper_pos], dim=0)
-                    
-                    if state.shape[0] != 8:
-                        state = torch.zeros(8, dtype=torch.float32)
-                    
-                    # 构建观测字典
-                    obs = {
-                        "observation.state": state.unsqueeze(0).to(device, non_blocking=True),
-                    }
-                    
-                    # 添加关键点
-                    img_width, img_height = 480, 480
-                    if keypoints is not None and len(keypoints) > 0:
-                        if isinstance(keypoints, np.ndarray):
-                            if len(keypoints.shape) == 1:
-                                kp_xy = keypoints.copy()
-                            elif len(keypoints.shape) == 2:
-                                kp_xy = keypoints[0].copy() if keypoints.shape[0] > 0 else np.zeros(2)
-                            else:
-                                kp_xy = np.zeros(2)
-                        else:
-                            kp_xy = np.zeros(2)
-                        
-                        if kp_xy[0] > 1.0 or kp_xy[1] > 1.0:
-                            kp_xy[0] = kp_xy[0] / img_width
-                            kp_xy[1] = kp_xy[1] / img_height
-                        kp_tensor = torch.tensor(kp_xy, dtype=torch.float32)
-                        obs["observation.keypoints"] = kp_tensor.unsqueeze(0).to(device, non_blocking=True)
-                    else:
-                        obs["observation.keypoints"] = torch.zeros(1, 2, device=device)
-                    
-                    # 添加图像
-                    if hasattr(self.act_policy, 'config') and hasattr(self.act_policy.config, 'image_features'):
-                        for cam_key in self.act_policy.config.image_features:
-                            if cam_key == "observation.images.head":
-                                obs[cam_key] = head_rgb_img
-                            elif cam_key == "observation.images.left":
-                                obs[cam_key] = left_rgb_img
-                            elif cam_key == "observation.images.head_init":
-                                obs[cam_key] = head_init_img
-                            elif cam_key == "observation.images.left_init":
-                                obs[cam_key] = left_init_img
-                    else:
-                        obs["observation.images.head"] = head_rgb_img
-                        obs["observation.images.left"] = left_rgb_img
-                        obs["observation.images.head_init"] = head_init_img
-                        obs["observation.images.left_init"] = left_init_img
-                    
-                    # 推理动作
-                    action = self.act_policy.select_action(obs)
-                    action = action.squeeze(0).cpu().numpy()
-                    
-                    # 执行动作
-                    self.act_robot_interface.robot.set_arm_servo_angle(1, action[:7], 0.4, 0, True)
-                    self.act_robot_interface.robot.set_gripper_position(1, action[7])
-                    
-                    # 打印输出（每10帧）
-                    if i % 10 == 0 or i < 3:
-                        kp_info = f", kps=({keypoints[0][0]:.3f}, {keypoints[0][1]:.3f})" if keypoints is not None and len(keypoints) > 0 else ""
-                        execution_time = (time.time() - time1) * 1000
-                        joints_str = f"[{', '.join([f'{x:.3f}' for x in action[:7]])}]"
-                        self.get_logger().info(f"ACT Frame {i:4d}/{self.act_data_len} | "
-                                              f"action: joints={joints_str}, gripper={action[7]:.3f} | "
-                                              f"time={execution_time:.3f}ms{kp_info}")
-            
-            self.get_logger().info("ACT 推理完成！")
-            
-        except Exception as e:
-            self.get_logger().error(f"ACT 推理异常: {e}")
-            import traceback
-            traceback.print_exc()
-        finally:
-            self.act_inference_active = False
-            self.space_pressed = False
-
-    def _keypoint_callback(self, msg):
-        """关键点消息回调"""
-        with self.keypoints_lock:
-            self.latest_keypoints_msg = msg
-
-    def _check_and_run_act(self):
-        """检查是否需要运行 ACT 推理（在主循环中调用）"""
-        if self.enable_act and self.coarse_positioning_complete and self.space_pressed and not self.act_inference_active:
-            self.space_pressed = False
-            # 在新线程中运行 ACT 推理，避免阻塞主循环
-            act_thread = threading.Thread(target=self._run_act_inference, daemon=True)
-            act_thread.start()
 
 
 def main(args=None):
