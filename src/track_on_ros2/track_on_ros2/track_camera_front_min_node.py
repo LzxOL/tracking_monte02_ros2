@@ -15,6 +15,7 @@ import cv2
 import json
 import numpy as np
 import rclpy
+import time
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from cv_bridge import CvBridge
@@ -70,6 +71,73 @@ if track_on_path and track_on_path not in sys.path:
 from tracking_module import TrackingModule  # noqa: E402
 
 
+#############################
+# RobotLib 路径和初始化
+#############################
+
+def _ensure_robotlib_visible(robot_lib_path: str):
+    """确保 RobotLib 在路径中可见"""
+    if not robot_lib_path:
+        return
+    ld_path = os.environ.get('LD_LIBRARY_PATH', '')
+    if robot_lib_path not in ld_path.split(':'):
+        os.environ['LD_LIBRARY_PATH'] = robot_lib_path + (':' + ld_path if ld_path else '')
+    if robot_lib_path not in sys.path:
+        sys.path.append(robot_lib_path)
+
+
+def _init_robot_arm_servo(robot_ip: str, robot_lib_path: str, component_type: int, logger):
+    """
+    初始化机器人手臂位姿（使用 set_arm_servo_angle）
+    Args:
+        robot_ip: 机器人IP地址
+        robot_lib_path: RobotLib库路径
+        component_type: 组件类型 (1: 左臂, 2: 右臂)
+        logger: ROS2 logger
+    Returns:
+        Robot实例或None
+    """
+    try:
+        _ensure_robotlib_visible(robot_lib_path)
+        from RobotLib import Robot  # type: ignore
+        
+        logger.info(f"连接机器人: {robot_ip}")
+        robot = Robot(robot_ip, '', '')
+        
+        # 启用手臂并设置为伺服模式
+        logger.info(f"启用手臂组件 {component_type} 并设置为伺服模式...")
+        success = robot.set_arm_enable(component_type, True)
+        if not success:
+            logger.warn(f"启用手臂失败: component_type={component_type}")
+            return None
+        
+        success = robot.set_arm_mode(component_type, 1)
+        if not success:
+            logger.warn(f"设置手臂模式失败: component_type={component_type}")
+            return None
+        
+        # 设置初始位姿（使用 set_arm_servo_angle）
+        positions = [-0.6006123423576355, 0.11826176196336746, 0.028828054666519165, 
+                     1.8238468170166016, -1.4655508995056152, 0.1113307848572731, 
+                     0.38727688789367676]
+        speed = 0.1
+        acc = 1.0
+        wait = True
+        
+        logger.info(f"设置手臂初始位姿（使用 set_arm_servo_angle）: {positions}")
+        success = robot.set_arm_servo_angle(component_type, positions, speed, acc, wait)
+        if success:
+            logger.info("手臂初始位姿设置成功")
+            time.sleep(1.5)  # 等待到位
+        else:
+            logger.warn("手臂初始位姿设置失败")
+        
+        return robot
+    except Exception as e:
+        logger.error(f"初始化机器人失败: {e}")
+        return None
+
+
 #########################################
 # 主节点类
 #########################################
@@ -78,6 +146,39 @@ class TrackCameraFrontMinNode(Node):
 
     def __init__(self):
         super().__init__('track_camera_front_min_node')
+
+        ######## 机器人初始化参数（在最开始） ########
+        self.declare_parameter('robot_ip', '192.168.22.63:50051')
+        try:
+            from ament_index_python.packages import get_package_share_directory  # type: ignore
+            default_lib = os.path.join(get_package_share_directory('Monte_api_ros2'), 'lib')
+        except Exception:
+            # fallback路径
+            default_lib = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))),
+                'src', 'Monte_api_ros2', 'lib'
+            )
+        self.declare_parameter('robot_lib_path', default_lib)
+        self.declare_parameter('robot_component_type', 2)  # 1: 左臂, 2: 右臂
+        self.declare_parameter('init_robot_arm', True)  # 是否初始化机器人手臂
+
+        # 读取机器人参数
+        robot_ip = self.get_parameter('robot_ip').value
+        robot_lib_path = self.get_parameter('robot_lib_path').value
+        robot_component_type = int(self.get_parameter('robot_component_type').value)
+        init_robot_arm = bool(self.get_parameter('init_robot_arm').value)
+
+        # 初始化机器人手臂（在最开始）
+        self.robot = None
+        if init_robot_arm:
+            self.get_logger().info("=" * 50)
+            self.get_logger().info("初始化机器人手臂位姿（使用 set_arm_servo_angle）...")
+            self.robot = _init_robot_arm_servo(robot_ip, robot_lib_path, robot_component_type, self.get_logger())
+            if self.robot:
+                self.get_logger().info("机器人手臂初始化完成")
+            else:
+                self.get_logger().warn("机器人手臂初始化失败，继续运行但无法控制手臂")
+            self.get_logger().info("=" * 50)
 
         ######## 参数 ########
         self.declare_parameter('checkpoint_path', '')
@@ -92,6 +193,13 @@ class TrackCameraFrontMinNode(Node):
         self.declare_parameter('depth_scale', 0.001)
         self.declare_parameter('print_3d', True)
         self.declare_parameter('print_3d_interval', 1)
+        
+        # 深度辅助跟踪参数
+        self.declare_parameter('use_depth_filter', True)  # 是否使用深度过滤
+        self.declare_parameter('max_background_depth', 3.5)  # 背景深度阈值（米），超过此值认为是背景
+        self.declare_parameter('depth_consistency_threshold', 0.3)  # 深度一致性阈值（米），跟踪时深度变化超过此值认为可能跟丢
+        self.declare_parameter('min_depth', 0.1)  # 最小有效深度（米）
+        self.declare_parameter('max_depth', 3.5)  # 最大有效深度（米）
 
         # 参数读取
         checkpoint_path = self.get_parameter('checkpoint_path').value
@@ -106,6 +214,13 @@ class TrackCameraFrontMinNode(Node):
         self.print_3d_interval = int(self.get_parameter('print_3d_interval').value)
         self.print_3d_interval = max(1, self.print_3d_interval)
         self.print_3d_counter = 0
+        
+        # 深度过滤参数
+        self.use_depth_filter = bool(self.get_parameter('use_depth_filter').value)
+        self.max_background_depth = float(self.get_parameter('max_background_depth').value)
+        self.depth_consistency_threshold = float(self.get_parameter('depth_consistency_threshold').value)
+        self.min_depth = float(self.get_parameter('min_depth').value)
+        self.max_depth = float(self.get_parameter('max_depth').value)
 
         ### 保存关键变量（原代码缺失的） ###
         self.intrinsics_file = intrinsics_file
@@ -152,7 +267,7 @@ class TrackCameraFrontMinNode(Node):
         )
         self.get_logger().info(f"订阅颜色图像话题: {camera_topic}")
 
-        #######################
+        #######################git tag v1.1.0
         # 可视化发布
         #######################
         if publish_visualization:
@@ -170,6 +285,10 @@ class TrackCameraFrontMinNode(Node):
         self.current_frame = None
         self.colors = self._generate_colors(200)
         self.should_exit = False
+        
+        # 深度辅助跟踪状态
+        self.initial_depths = {}  # 记录每个点的初始深度 {point_id: depth}
+        self.initial_depth_range = None  # 初始深度范围 (min_depth, max_depth)
 
         if self.show_interactive_window:
             cv2.namedWindow("Front Tracking")
@@ -226,7 +345,19 @@ class TrackCameraFrontMinNode(Node):
         if self.tracking_started and not self.first_frame_captured:
             if len(self.selected_points) > 0:
                 try:
-                    queries = np.array(self.selected_points, dtype=np.float32)
+                    # 深度过滤：过滤掉背景点
+                    filtered_points = self._filter_background_points(self.selected_points)
+                    if len(filtered_points) == 0:
+                        self.get_logger().warn("所有选中的点都被深度过滤掉（可能是背景），请重新选择前景点")
+                        self.tracking_started = False
+                        return
+                    
+                    if len(filtered_points) < len(self.selected_points):
+                        self.get_logger().info(
+                            f"深度过滤: {len(self.selected_points)} -> {len(filtered_points)} 个有效点"
+                        )
+                    
+                    queries = np.array(filtered_points, dtype=np.float32)
                     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                     init_out = self.tracker.initialize_tracking(queries, rgb)
 
@@ -236,6 +367,9 @@ class TrackCameraFrontMinNode(Node):
                     else:
                         points, visibility = init_out
 
+                    # 记录初始深度信息
+                    self._record_initial_depths(points, visibility)
+                    
                     self.first_frame_captured = True
                     self.publish_keypoints(points, visibility, header)
                     self._compute_and_log_3d(points, visibility)
@@ -254,16 +388,36 @@ class TrackCameraFrontMinNode(Node):
                     visibility = np.array(out[1], dtype=bool)
                 else:
                     points, visibility = out
+
+                # 深度一致性检查：如果深度变化过大，可能是跟丢到背景
+                if self.use_depth_filter and self.initial_depth_range is not None:
+                    visibility = self._validate_depth_consistency(points, visibility)
+
             except Exception as e:
                 self.get_logger().error(f"跟踪失败: {e}")
                 return
 
-            # 绘制跟踪结果
+            # 绘制跟踪结果（根据深度验证结果使用不同颜色）
             for i, (x, y) in enumerate(points):
                 visible = bool(visibility[i])
                 color = self.colors[i % len(self.colors)]
-                if visible:
+                
+                # 检查深度一致性
+                depth_valid = True
+                if self.use_depth_filter and i in self.initial_depths:
+                    current_depth = self._depth_at(x, y)
+                    if current_depth is not None:
+                        initial_depth = self.initial_depths[i]
+                        if abs(current_depth - initial_depth) > self.depth_consistency_threshold:
+                            depth_valid = False
+                            # 如果深度变化过大，使用红色标记
+                            color = (0, 0, 255)
+                
+                if visible and depth_valid:
                     cv2.circle(display, (int(x), int(y)), 8, color, -1)
+                elif visible:
+                    # 可见但深度异常，用红色空心圆
+                    cv2.circle(display, (int(x), int(y)), 8, color, 2)
                 else:
                     cv2.circle(display, (int(x), int(y)), 8, color, 2)
                 cv2.putText(display, f"{i+1}", (int(x)+10, int(y)-10),
@@ -317,6 +471,9 @@ class TrackCameraFrontMinNode(Node):
         self.first_frame_captured = False
         self.selected_points = []
         self.frame_count = 0
+        # 重置深度辅助跟踪状态
+        self.initial_depths = {}
+        self.initial_depth_range = None
         self.get_logger().info("跟踪已重置")
 
     ############################################
@@ -630,6 +787,111 @@ class TrackCameraFrontMinNode(Node):
         if event == cv2.EVENT_LBUTTONDOWN and not self.tracking_started:
             self.selected_points.append([x, y])
             self.get_logger().info(f"添加点 {len(self.selected_points)}: ({x},{y})")
+
+    ############################################
+    # 深度辅助跟踪方法
+    ############################################
+    def _filter_background_points(self, points):
+        """
+        使用深度信息过滤背景点
+        返回：过滤后的点列表（只保留前景点）
+        """
+        if not self.use_depth_filter or self.latest_depth is None:
+            return points
+        
+        filtered = []
+        for point in points:
+            u, v = point[0], point[1]
+            depth = self._depth_at(u, v)
+            
+            if depth is None:
+                # 没有深度信息，保留该点（让跟踪算法决定）
+                filtered.append(point)
+                continue
+            
+            # 检查深度是否在有效范围内
+            if depth < self.min_depth or depth > self.max_depth:
+                self.get_logger().debug(
+                    f"点 ({u:.1f}, {v:.1f}) 深度 {depth:.3f}m 超出范围 [{self.min_depth}, {self.max_depth}]"
+                )
+                continue
+            
+            # 检查是否是背景（深度过大）
+            if depth > self.max_background_depth:
+                self.get_logger().info(
+                    f"过滤背景点 ({u:.1f}, {v:.1f}): 深度 {depth:.3f}m > {self.max_background_depth}m"
+                )
+                continue
+            
+            filtered.append(point)
+        
+        return filtered
+    
+    def _record_initial_depths(self, points, visibility):
+        """
+        记录初始跟踪点的深度信息
+        """
+        if not self.use_depth_filter or self.latest_depth is None:
+            return
+        
+        depths = []
+        self.initial_depths = {}
+        
+        for i, (x, y) in enumerate(points):
+            if visibility[i]:
+                depth = self._depth_at(x, y)
+                if depth is not None and self.min_depth <= depth <= self.max_depth:
+                    self.initial_depths[i] = depth
+                    depths.append(depth)
+        
+        if depths:
+            self.initial_depth_range = (min(depths), max(depths))
+            self.get_logger().info(
+                f"记录初始深度范围: [{self.initial_depth_range[0]:.3f}, {self.initial_depth_range[1]:.3f}]m"
+            )
+    
+    def _validate_depth_consistency(self, points, visibility):
+        """
+        验证跟踪点的深度一致性
+        如果深度变化过大，可能是跟丢到背景，将点标记为不可见
+        返回：更新后的 visibility 数组
+        """
+        if not self.use_depth_filter or self.initial_depth_range is None:
+            return visibility
+        
+        updated_visibility = visibility.copy()
+        min_initial_depth, max_initial_depth = self.initial_depth_range
+        
+        for i, (x, y) in enumerate(points):
+            if not visibility[i] or i not in self.initial_depths:
+                continue
+            
+            current_depth = self._depth_at(x, y)
+            if current_depth is None:
+                # 没有深度信息，保持原可见性
+                continue
+            
+            initial_depth = self.initial_depths[i]
+            depth_diff = abs(current_depth - initial_depth)
+            
+            # 如果深度变化超过阈值，可能是跟丢到背景
+            if depth_diff > self.depth_consistency_threshold:
+                # 额外检查：如果当前深度明显超出初始范围，更可能是背景
+                if current_depth > max_initial_depth + self.depth_consistency_threshold:
+                    updated_visibility[i] = False
+                    self.get_logger().debug(
+                        f"点 {i+1} 深度异常: 初始={initial_depth:.3f}m, "
+                        f"当前={current_depth:.3f}m (差值={depth_diff:.3f}m), 标记为不可见"
+                    )
+                elif current_depth < min_initial_depth - self.depth_consistency_threshold:
+                    # 深度突然变小很多，也可能是异常
+                    updated_visibility[i] = False
+                    self.get_logger().debug(
+                        f"点 {i+1} 深度异常: 初始={initial_depth:.3f}m, "
+                        f"当前={current_depth:.3f}m (差值={depth_diff:.3f}m), 标记为不可见"
+                    )
+        
+        return updated_visibility
 
     ############################################
     # 加载相机内参
