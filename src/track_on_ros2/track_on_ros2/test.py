@@ -193,6 +193,12 @@ class TrackCameraFrontMinNode(Node):
         self.declare_parameter('depth_scale', 0.001)
         self.declare_parameter('print_3d', True)
         self.declare_parameter('print_3d_interval', 1)
+        
+        # 深度验证和运动预测参数
+        self.declare_parameter('use_depth_validation', True)  # 是否使用深度验证
+        self.declare_parameter('max_depth_change', 0.5)  # 允许的最大深度变化（米）
+        self.declare_parameter('background_depth_threshold', 2.5)  # 背景深度阈值（米）
+        self.declare_parameter('motion_prediction_search_radius', 20)  # 运动预测搜索半径（像素）
 
         # 参数读取
         checkpoint_path = self.get_parameter('checkpoint_path').value
@@ -207,6 +213,12 @@ class TrackCameraFrontMinNode(Node):
         self.print_3d_interval = int(self.get_parameter('print_3d_interval').value)
         self.print_3d_interval = max(1, self.print_3d_interval)
         self.print_3d_counter = 0
+        
+        # 深度验证参数
+        self.use_depth_validation = bool(self.get_parameter('use_depth_validation').value)
+        self.max_depth_change = float(self.get_parameter('max_depth_change').value)
+        self.background_depth_threshold = float(self.get_parameter('background_depth_threshold').value)
+        self.motion_prediction_search_radius = int(self.get_parameter('motion_prediction_search_radius').value)
 
         ### 保存关键变量（原代码缺失的） ###
         self.intrinsics_file = intrinsics_file
@@ -271,6 +283,10 @@ class TrackCameraFrontMinNode(Node):
         self.current_frame = None
         self.colors = self._generate_colors(200)
         self.should_exit = False
+        
+        # 深度验证和运动预测状态
+        self.previous_points = None
+        self.previous_visibility = None
 
         if self.show_interactive_window:
             cv2.namedWindow("Front Tracking")
@@ -338,6 +354,9 @@ class TrackCameraFrontMinNode(Node):
                         points, visibility = init_out
 
                     self.first_frame_captured = True
+                    # 保存初始帧用于深度验证
+                    self.previous_points = points.copy()
+                    self.previous_visibility = visibility.copy()
                     self.publish_keypoints(points, visibility, header)
                     self._compute_and_log_3d(points, visibility)
                     self._publish_points3d(points, visibility, header)
@@ -355,6 +374,16 @@ class TrackCameraFrontMinNode(Node):
                     visibility = np.array(out[1], dtype=bool)
                 else:
                     points, visibility = out
+
+                # 深度验证和修正
+                if self.use_depth_validation and self.latest_depth is not None:
+                    points, visibility = self._validate_and_correct_with_depth(
+                        points, visibility, self.previous_points, self.previous_visibility
+                    )
+                
+                # 保存当前帧用于下一帧的运动预测
+                self.previous_points = points.copy()
+                self.previous_visibility = visibility.copy()
 
             except Exception as e:
                 self.get_logger().error(f"跟踪失败: {e}")
@@ -391,9 +420,6 @@ class TrackCameraFrontMinNode(Node):
                 self.start_tracking()
             elif key == ord("r"):
                 self.reset_tracking()
-            elif key == ord("c"):
-                # 停止跟踪并清除点，允许重新选择
-                self.stop_and_clear_points()
 
         # 发布可视化图像
         if self.vis_image_pub is not None:
@@ -422,19 +448,10 @@ class TrackCameraFrontMinNode(Node):
         self.first_frame_captured = False
         self.selected_points = []
         self.frame_count = 0
+        # 重置深度验证状态
+        self.previous_points = None
+        self.previous_visibility = None
         self.get_logger().info("跟踪已重置")
-
-    def stop_and_clear_points(self):
-        """停止跟踪并清除所有点，允许重新选择关键点"""
-        try:
-            self.tracker.reset()
-        except:
-            pass
-        self.tracking_started = False
-        self.first_frame_captured = False
-        self.selected_points = []
-        self.frame_count = 0
-        self.get_logger().info("已停止跟踪并清除所有点，可以重新点击选择关键点")
 
     ############################################
     # 服务回调
@@ -739,6 +756,120 @@ class TrackCameraFrontMinNode(Node):
         if vals.size == 0:
             return None
         return float(np.median(vals))
+
+    ############################################
+    # 深度验证和运动预测修正
+    ############################################
+    def _validate_and_correct_with_depth(self, points, visibility, prev_points=None, prev_visibility=None):
+        """
+        使用深度信息验证和修正跟踪结果
+        当检测到深度异常（跟丢到背景）时，使用运动模型预测修正位置
+        """
+        if self.latest_depth is None or self.current_frame is None:
+            return points, visibility
+        
+        corrected_points = points.copy()
+        corrected_visibility = visibility.copy()
+        h, w = self.current_frame.shape[:2]
+        
+        for i in range(len(points)):
+            if not visibility[i]:
+                continue
+            
+            x, y = float(points[i][0]), float(points[i][1])
+            current_depth = self._depth_at(x, y)
+            
+            if current_depth is None:
+                continue
+            
+            # 检查1: 深度是否突然变大（跟丢到背景）
+            if current_depth > self.background_depth_threshold:
+                # 如果之前有有效点，尝试用运动模型预测
+                if prev_points is not None and i < len(prev_points) and prev_visibility is not None and prev_visibility[i]:
+                    # 计算运动速度
+                    prev_x, prev_y = float(prev_points[i][0]), float(prev_points[i][1])
+                    dx = x - prev_x
+                    dy = y - prev_y
+                    
+                    # 预测位置（基于运动方向）
+                    predicted_x = x + dx
+                    predicted_y = y + dy
+                    
+                    # 在预测位置附近搜索有效深度
+                    search_radius = self.motion_prediction_search_radius
+                    best_point = None
+                    best_depth = float('inf')
+                    prev_depth = self._depth_at(prev_x, prev_y)
+                    target_depth = prev_depth if prev_depth is not None and prev_depth < self.background_depth_threshold else 0.5
+                    
+                    # 在预测位置周围搜索
+                    for sx in range(int(predicted_x - search_radius), int(predicted_x + search_radius), 5):
+                        for sy in range(int(predicted_y - search_radius), int(predicted_y + search_radius), 5):
+                            if 0 <= sx < w and 0 <= sy < h:
+                                d = self._depth_at(sx, sy)
+                                if d is not None and d < self.background_depth_threshold:
+                                    # 选择最接近目标深度的点
+                                    depth_diff = abs(d - target_depth)
+                                    if depth_diff < abs(best_depth - target_depth):
+                                        best_depth = d
+                                        best_point = (sx, sy)
+                    
+                    if best_point is not None:
+                        corrected_points[i] = np.array(best_point, dtype=np.float32)
+                        self.get_logger().debug(
+                            f"点{i+1}深度异常({current_depth:.3f}m)，已修正到预测位置({best_point[0]:.1f},{best_point[1]:.1f})，深度={best_depth:.3f}m"
+                        )
+                    else:
+                        # 如果找不到有效点，标记为不可见
+                        corrected_visibility[i] = False
+                        self.get_logger().warn(
+                            f"点{i+1}深度异常({current_depth:.3f}m)且无法修正，标记为不可见"
+                        )
+                else:
+                    # 没有历史信息，直接标记为不可见
+                    corrected_visibility[i] = False
+                    self.get_logger().warn(
+                        f"点{i+1}深度异常({current_depth:.3f}m)且无历史信息，标记为不可见"
+                    )
+            
+            # 检查2: 深度变化是否过大（与上一帧比较）
+            elif prev_points is not None and i < len(prev_points) and prev_visibility is not None and prev_visibility[i]:
+                prev_depth = self._depth_at(prev_points[i][0], prev_points[i][1])
+                if prev_depth is not None:
+                    depth_change = abs(current_depth - prev_depth)
+                    if depth_change > self.max_depth_change:
+                        # 深度变化过大，可能跟丢，使用运动预测
+                        prev_x, prev_y = float(prev_points[i][0]), float(prev_points[i][1])
+                        dx = x - prev_x
+                        dy = y - prev_y
+                        
+                        # 计算运动步长
+                        step = np.sqrt(dx*dx + dy*dy)
+                        if step > 0:
+                            # 限制步长，使用更保守的预测
+                            max_step = 15  # 最大预测步长
+                            if step > max_step:
+                                dx = dx / step * max_step
+                                dy = dy / step * max_step
+                            
+                            predicted_x = prev_x + dx
+                            predicted_y = prev_y + dy
+                            
+                            # 在预测位置验证深度
+                            pred_depth = self._depth_at(predicted_x, predicted_y)
+                            if pred_depth is not None and pred_depth < self.background_depth_threshold:
+                                # 深度合理，使用预测位置
+                                corrected_points[i] = np.array([predicted_x, predicted_y], dtype=np.float32)
+                                self.get_logger().debug(
+                                    f"点{i+1}深度变化过大({depth_change:.3f}m)，使用预测位置，深度={pred_depth:.3f}m"
+                                )
+                            else:
+                                # 预测位置深度也不合理，保持原位置但记录警告
+                                self.get_logger().debug(
+                                    f"点{i+1}深度变化过大({depth_change:.3f}m)，但预测位置深度无效，保持原位置"
+                                )
+        
+        return corrected_points, corrected_visibility
 
     ############################################
     # 鼠标点击添加关键点

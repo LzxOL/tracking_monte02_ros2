@@ -40,11 +40,11 @@ class Points3DTFToArmBaseNode(Node):
         # 粗定位控制参数
         self.declare_parameter('enable_coarse_move', True)
         self.declare_parameter('component_type', 2)  # 1: 左臂  2: 右臂
-        self.declare_parameter('distance_stop', 0.3)  # m
+        self.declare_parameter('distance_stop', 0.5)  # m
         self.declare_parameter('step_size', 0.10)     # 每步前进距离 m
         self.declare_parameter('cmd_interval', 0.3)   # 连续set_arm_position发送最小间隔 s（当wait=False）
         self.declare_parameter('max_speed', 0.10)     # m/s
-        self.declare_parameter('max_acc', 0.30)       # m/s^2
+        self.declare_parameter('max_acc', 0.15)       # m/s^2
         self.declare_parameter('use_wait', False)     # set_arm_position 的 wait
         self.declare_parameter('target_id', -1)       # 若>=0，则优先匹配channel 'id'
         # 外参文件 + 方向 + 坐标系约定
