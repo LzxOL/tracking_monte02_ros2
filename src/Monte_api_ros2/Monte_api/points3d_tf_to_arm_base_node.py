@@ -6,6 +6,7 @@ import numpy as np
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import PointCloud
+from std_msgs.msg import Bool
 from geometry_msgs.msg import Point32
 
 
@@ -22,7 +23,7 @@ class Points3DTFToArmBaseNode(Node):
         super().__init__('points3d_tf_to_arm_base_node')
 
         # 参数：RobotLib 连接
-        self.declare_parameter('robot_ip', '192.168.22.63:50051')
+        self.declare_parameter('robot_ip', '192.168.22.112:50051')
         try:
             from ament_index_python.packages import get_package_share_directory  # type: ignore
             default_lib = os.path.join(get_package_share_directory('Monte_api_ros2'), 'lib')
@@ -39,7 +40,7 @@ class Points3DTFToArmBaseNode(Node):
         self.declare_parameter('print_limit', 10)
         # 粗定位控制参数
         self.declare_parameter('enable_coarse_move', True)
-        self.declare_parameter('component_type', 2)  # 1: 左臂  2: 右臂
+        self.declare_parameter('component_type', 1)  # 1: 左臂  2: 右臂
         self.declare_parameter('distance_stop', 0.5)  # m
         self.declare_parameter('step_size', 0.08)     # 每步前进距离 m
         self.declare_parameter('cmd_interval', 0.3)   # 连续set_arm_position发送最小间隔 s（当wait=False）
@@ -49,7 +50,7 @@ class Points3DTFToArmBaseNode(Node):
         self.declare_parameter('target_id', -1)       # 若>=0，则优先匹配channel 'id'
         # 外参文件 + 方向 + 坐标系约定
         ws_root = self._get_workspace_root()
-        default_extrinsic = os.path.join(ws_root, 'joint_r7_wrist_roll.txt') if ws_root else ''
+        default_extrinsic = os.path.join(ws_root, 'config', 'joint_lt_sensor_rgbd_12.txt') if ws_root else ''
         self.declare_parameter('wrist_extrinsic_file', default_extrinsic)
         self.declare_parameter('invert_extrinsic', False)  # 若文件给的是 T_{source<-wrist}，则置 True 取逆
         # 若外参以相机笛卡尔坐标（x前,y左,z上）为源，而输入为光学坐标（x右,y下,z前），需先做 optical->camera 固定旋转
@@ -145,6 +146,9 @@ class Points3DTFToArmBaseNode(Node):
         self.pub = None
         if self.publish_transformed:
             self.pub = self.create_publisher(PointCloud, 'tracking/points3d_in_arm_base', 10)
+        # 粗定位完成通知
+        self.coarse_done_pub = self.create_publisher(Bool, 'tracking/coarse_done', 10)
+        self._last_msg_was_coarse = False
 
         # ---- 粗定位控制相关 ----
         self.enable_coarse_move = bool(self.get_parameter('enable_coarse_move').value)
@@ -208,6 +212,15 @@ class Points3DTFToArmBaseNode(Node):
             for ch in msg.channels:
                 if ch.name == 'id':
                     ids = ch.values
+                    break
+        except Exception:
+            pass
+
+        # 检测是否为粗定位请求（PointCloud.channels 包含 'coarse'）
+        try:
+            for ch in msg.channels:
+                if ch.name == 'coarse' and len(ch.values) > 0 and float(ch.values[0]) > 0.0:
+                    self._last_msg_was_coarse = True
                     break
         except Exception:
             pass
@@ -352,8 +365,17 @@ class Points3DTFToArmBaseNode(Node):
             self.get_logger().info(f'[粗定位] dist={d:.3f} m, curr=({p_curr[0]:.3f},{p_curr[1]:.3f},{p_curr[2]:.3f}), target=({self.target_point[0]:.3f},{self.target_point[1]:.3f},{self.target_point[2]:.3f})')
             self._last_log_ts = now
 
-        # 到达阈值则不再发送
+        # 到达阈值则不再发送 —— 如果是粗定位请求，发布 coarse_done
         if d <= self.distance_stop:
+            try:
+                if getattr(self, "_last_msg_was_coarse", False):
+                    msg = Bool()
+                    msg.data = True
+                    self.coarse_done_pub.publish(msg)
+                    # clear flag so we don't repeatedly publish
+                    self._last_msg_was_coarse = False
+            except Exception:
+                pass
             return
 
         # 计算一步目标（不越过阈值）

@@ -23,7 +23,7 @@ def generate_launch_description():
     ws_root = get_workspace_root()
     if ws_root:
         default_checkpoint_path_str = os.path.join(ws_root, 'src', 'track_on', 'checkpoints', 'track_on_checkpoint.pt')
-        default_intrinsics_file_str = os.path.join(ws_root, 'camera_head_front_intrinsics.txt')
+        default_intrinsics_file_str = os.path.join(ws_root, 'config', 'camera_head_front_intrinsics.txt')
     else:
         default_checkpoint_path_str = ''
         default_intrinsics_file_str = ''

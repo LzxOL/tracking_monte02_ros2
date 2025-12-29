@@ -21,7 +21,7 @@ from rclpy.qos import qos_profile_sensor_data
 from cv_bridge import CvBridge
 from sensor_msgs.msg import Image, PointCloud, ChannelFloat32
 from geometry_msgs.msg import Point32
-from std_msgs.msg import Header
+from std_msgs.msg import Header, Bool
 import matplotlib.pyplot as plt
 import re
 
@@ -124,10 +124,11 @@ def _init_robot_arm_servo(robot_ip: str, robot_lib_path: str, component_type: in
             logger.warn(f"设置手臂模式失败: component_type={component_type}")
             return None
         
-        # 设置初始位姿（使用 set_arm_servo_angle）
+        # 设置初始位姿（使用 set_arm_servo_angle）右手的初始位置
         positions = [-0.6006123423576355, 0.11826176196336746, 0.028828054666519165, 
                      1.8238468170166016, -1.4655508995056152, 0.1113307848572731, 
                      0.38727688789367676]
+        
         speed = 0.1
         acc = 1.0
         wait = True
@@ -198,7 +199,7 @@ class TrackCameraFrontMinNode(Node):
         # 默认从指定文件读取相机内参（像素单位）
         # 获取工作空间根目录
         ws_root = self._get_workspace_root()
-        default_intrinsics = os.path.join(ws_root, 'camera_rhead_front_intrinsics_02_10.txt') if ws_root else ''
+        default_intrinsics = os.path.join(ws_root, 'config', 'camera_rhead_front_intrinsics_02_10.txt') if ws_root else ''
         self.declare_parameter('intrinsics_file', default_intrinsics)
         self.declare_parameter('depth_topic', '/right/depth/stream')
         self.declare_parameter('depth_scale', 0.001)
@@ -305,6 +306,9 @@ class TrackCameraFrontMinNode(Node):
         self.initial_depths = {}  # 初始深度记录 {point_id: depth}
         self.depth_history = {}  # 深度历史 {point_id: [depth1, depth2, ...]}
         self._depths_recorded = False  # 是否已记录初始深度
+        # 粗定位状态
+        self.waiting_for_coarse = False
+        self.coarse_completed = False
 
         if self.show_interactive_window:
             cv2.namedWindow("Front Tracking")
@@ -329,6 +333,9 @@ class TrackCameraFrontMinNode(Node):
         self.keypoints_pub = self.create_publisher(self.Keypoints, "tracking/keypoints", 10)
         # 3D点云发布（PointCloud）
         self.pc_pub = self.create_publisher(PointCloud, "tracking/points3d", 10)
+        # 粗定位 2D keypoint 发布（通知）和监听粗定位完成
+        self.coarse_kp_pub = self.create_publisher(self.Keypoints, "tracking/coarse_keypoints", 10)
+        self.coarse_done_sub = self.create_subscription(Bool, "tracking/coarse_done", self._coarse_done_callback, 10)
 
         self.get_logger().info("前端摄像头跟踪节点已启动（含 JSON 3D 打印）")
     ############################################
@@ -477,6 +484,15 @@ class TrackCameraFrontMinNode(Node):
         self.depth_history = {}
         self._depths_recorded = False
         self.get_logger().info("跟踪已重置")
+
+    def _coarse_done_callback(self, msg: Bool):
+        try:
+            if msg.data:
+                self.waiting_for_coarse = False
+                self.coarse_completed = True
+                self.get_logger().info("已收到粗定位完成通知：现在可以选择跟踪关键点 (tracking/keypoints)")
+        except Exception as e:
+            self.get_logger().warn(f"处理 coarse_done 回调失败: {e}")
 
     def stop_and_clear_points(self):
         """停止跟踪并清除所有点，允许重新选择关键点"""
@@ -986,8 +1002,64 @@ class TrackCameraFrontMinNode(Node):
     # 鼠标点击添加关键点
     ############################################
     def mouse_callback(self, event, x, y, flags, param):
-        if event == cv2.EVENT_LBUTTONDOWN and not self.tracking_started:
-            self.selected_points.append([x, y])
+        if event != cv2.EVENT_LBUTTONDOWN:
+            return
+
+        # 如果正在等待粗定位完成，忽略点击
+        if getattr(self, "waiting_for_coarse", False):
+            self.get_logger().info("正在等待粗定位完成，点击被忽略")
+            return
+
+        # 如果还未进行粗定位（coarse_completed==False）且未开始图像跟踪
+        if not getattr(self, "coarse_completed", False) and not self.tracking_started:
+            try:
+                # 发布 2D coarse Keypoint（通知）
+                kp_msg = self.Keypoints()
+                kp_msg.header = Header()
+                kp_msg.header.stamp = self.get_clock().now().to_msg()
+                kp_msg.num_keypoints = 1
+                from track_on_ros2_msgs.msg import Keypoint
+                kp = Keypoint()
+                kp.id = 0
+                kp.x = float(x)
+                kp.y = float(y)
+                kp.visible = True
+                kp_msg.keypoints.append(kp)
+                self.coarse_kp_pub.publish(kp_msg)
+
+                # 计算 3D（若可用）并发布到 tracking/points3d （points3d_tf_to_arm_base_node 订阅）
+                Z = self._depth_at(x, y, ksize=5)
+                pc = PointCloud()
+                pc.header = Header()
+                pc.header.stamp = kp_msg.header.stamp
+                pc.header.frame_id = "right_camera_color_optical_frame"
+                if Z is not None and all(v is not None for v in [self.fx, self.fy, self.cx, self.cy]):
+                    X = (float(x) - self.cx) / self.fx * Z
+                    Y = (float(y) - self.cy) / self.fy * Z
+                    p = Point32(x=float(X), y=float(Y), z=float(Z))
+                    pc.points = [p]
+                else:
+                    pc.points = []
+                # 标记为粗定位点（在 channel 中添加 coarse=1.0）
+                try:
+                    ch = ChannelFloat32(name='coarse', values=[1.0])
+                    pc.channels = [ch]
+                except Exception:
+                    pass
+                try:
+                    self.pc_pub.publish(pc)
+                except Exception:
+                    pass
+
+                self.waiting_for_coarse = True
+                self.get_logger().info(f"已发布粗定位点 (u={x}, v={y}, Z={Z}), 等待粗定位完成...")
+            except Exception as e:
+                self.get_logger().warn(f"发布粗定位点失败: {e}")
+            return
+
+        # 否则按原逻辑把点击当作跟踪点选择（用于 tracking/keypoints）
+        if not self.tracking_started:
+            self.selected_points.append([float(x), float(y)])
             self.get_logger().info(f"添加点 {len(self.selected_points)}: ({x},{y})")
 
     ############################################

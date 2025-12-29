@@ -76,8 +76,8 @@ def find_track_on_path():
     for _ in range(5):
         if os.path.basename(ws_root) == 'tracking_with_cameara_ws':
             known_path = os.path.join(ws_root, 'src', 'track_on')
-            if os.path.isdir(known_path) and os.path.isfile(os.path.join(known_path, 'tracking_module.py')):
-                return known_path
+        if os.path.isdir(known_path) and os.path.isfile(os.path.join(known_path, 'tracking_module.py')):
+            return known_path
         ws_root = os.path.dirname(ws_root)
         if ws_root == os.path.dirname(ws_root):
             break

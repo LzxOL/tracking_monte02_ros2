@@ -111,7 +111,7 @@ class Points3DTestPublisher(Node):
         self.declare_parameter('subscribe_base', True)
 
         ws_root = self._get_workspace_root()
-        default_extrinsic = os.path.join(ws_root, 'joint_r7_wrist_roll.txt') if ws_root else ''
+        default_extrinsic = os.path.join(ws_root, 'config', 'joint_r7_wrist_roll.txt') if ws_root else ''
         self.declare_parameter('wrist_extrinsic_file', default_extrinsic)
         self.declare_parameter('invert_extrinsic', False)
         self.declare_parameter('apply_optical_to_camera_rotation', False)

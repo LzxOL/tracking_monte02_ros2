@@ -38,7 +38,7 @@ class CoarseApproachWithSetArmPosition(Node):
         # 话题/坐标/控制参数
         self.declare_parameter('target_topic', 'tracking/points3d_in_arm_base')
         self.declare_parameter('target_frame', 'link_r0_arm_base')
-        self.declare_parameter('component_type', 2)  # 1:左臂 2:右臂
+        self.declare_parameter('component_type', 1)  # 1:左臂 2:右臂
         self.declare_parameter('distance_stop', 0.5)  # m
         self.declare_parameter('step_size', 0.10)     # 每步前进距离 m
         self.declare_parameter('step_interval', 0.3)  # 每步发送间隔 s（仅当 wait=False 时生效）

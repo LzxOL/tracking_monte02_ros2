@@ -198,7 +198,7 @@ class TrackCameraFrontMinNode(Node):
         # 默认从指定文件读取相机内参（像素单位）
         # 获取工作空间根目录
         ws_root = self._get_workspace_root()
-        default_intrinsics = os.path.join(ws_root, 'camera_rhead_front_intrinsics_02_10.txt') if ws_root else ''
+        default_intrinsics = os.path.join(ws_root, 'config', 'camera_rhead_front_intrinsics_02_10.txt') if ws_root else ''
         self.declare_parameter('intrinsics_file', default_intrinsics)
         self.declare_parameter('depth_topic', '/right/depth/stream')
         self.declare_parameter('depth_scale', 0.001)

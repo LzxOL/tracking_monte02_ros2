@@ -18,3 +18,11 @@ frames_2025-12-02_10.19.23.pdf
 run.ipynb
 # 如希望排除该目录内所有 .pt，可用（可选，二选一）
 # /src/track_on/checkpoints/.pt
+
+# OrbbecSDK_ROS2
+src/OrbbecSDK_ROS2/
+
+# 特定文件
+src/track_on_ros2/track_on_ros2/track_camera_orbbec_node.py
+src/track_on_ros2/track_on_ros2/track_camera_front_node_12_3.py
+
