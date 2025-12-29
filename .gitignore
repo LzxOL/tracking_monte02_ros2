@@ -26,3 +26,4 @@ src/OrbbecSDK_ROS2/
 src/track_on_ros2/track_on_ros2/track_camera_orbbec_node.py
 src/track_on_ros2/track_on_ros2/track_camera_front_node_12_3.py
 
+tracking_with_orbbec.sh
