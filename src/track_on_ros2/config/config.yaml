@@ -1,0 +1,31 @@
+# TrackOn ROS2 配置文件
+# 用于配置跟踪相关的参数
+
+# 相机选择配置
+camera:
+  # 1: 左相机 (left), 2: 右相机 (right)
+  selection: 1
+
+# 左相机配置
+left_camera:
+  camera_topic: "/left/color/video"
+  depth_topic: "/left/depth/stream"
+  intrinsics_file: "config/camera_lhead_front_intrinsics_02_12.txt"
+
+# 右相机配置
+right_camera:
+  camera_topic: "/right/color/video"
+  depth_topic: "/right/depth/stream"
+  intrinsics_file: "config/camera_rhead_front_intrinsics_02_10.txt"
+
+# 机器人配置
+robot:
+  ip: "192.168.22.112:50051"  # 机器人IP地址和端口
+  component_type: 1  # 1: 左臂, 2: 右臂
+  init_robot_arm: true  # 是否初始化机器人手臂
+
+# 跟踪参数
+tracking:
+  checkpoint_path: "src/track_on/checkpoints/track_on_checkpoint.pt"
+  publish_visualization: true
+  show_interactive_window: true

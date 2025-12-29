@@ -28,3 +28,7 @@ src/track_on_ros2/track_on_ros2/track_camera_front_node_12_3.py
 
 tracking_with_orbbec.sh
 /src/Monte_api_ros2/example
+
+src/Monte_api_ros2/Monte_api/coarse_approach_with_set_arm_position.py
+src/Monte_api_ros2/Monte_api/control_node.py
+src/Monte_api_ros2/Monte_api/points3d_tf_to_arm_base_node_no_control.py

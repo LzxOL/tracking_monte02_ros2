@@ -8,6 +8,7 @@ from rclpy.node import Node
 from sensor_msgs.msg import PointCloud
 from std_msgs.msg import Bool
 from geometry_msgs.msg import Point32
+import yaml
 
 
 class Points3DTFToArmBaseNode(Node):
@@ -19,11 +20,44 @@ class Points3DTFToArmBaseNode(Node):
       3) RobotLib TF T_{base<-wrist}：p_base = R·p_wrist + t
     打印三坐标系下的点，并可选发布到 tracking/points3d_in_arm_base。
     """
+
+    def _load_config(self):
+        """加载配置文件"""
+        # 获取包路径
+        try:
+            from ament_index_python.packages import get_package_share_directory
+            package_path = get_package_share_directory('Monte_api_ros2')
+            config_file = os.path.join(package_path, 'config', 'config.yaml')
+        except Exception:
+            # 如果找不到包路径，使用相对路径
+            current_dir = os.path.dirname(os.path.abspath(__file__))
+            config_file = os.path.join(current_dir, '..', 'config', 'config.yaml')
+
+        if not os.path.exists(config_file):
+            self.get_logger().error(f'配置文件不存在: {config_file}')
+            return None
+
+        try:
+            with open(config_file, 'r', encoding='utf-8') as f:
+                config = yaml.safe_load(f)
+            self.get_logger().info(f'成功加载配置文件: {config_file}')
+            return config
+        except Exception as e:
+            self.get_logger().error(f'加载配置文件失败: {e}')
+            return None
+
     def __init__(self):
         super().__init__('points3d_tf_to_arm_base_node')
 
+        # 加载配置文件
+        self.config = self._load_config()
+        if self.config is None:
+            self.get_logger().error('无法加载配置文件，使用默认参数')
+            self.config = {}
+
         # 参数：RobotLib 连接
-        self.declare_parameter('robot_ip', '192.168.22.112:50051')
+        default_robot_ip = self.config.get('robot', {}).get('ip', '192.168.22.112:50051')
+        self.declare_parameter('robot_ip', default_robot_ip)
         try:
             from ament_index_python.packages import get_package_share_directory  # type: ignore
             default_lib = os.path.join(get_package_share_directory('Monte_api_ros2'), 'lib')
@@ -32,25 +66,39 @@ class Points3DTFToArmBaseNode(Node):
         self.declare_parameter('robot_lib_path', default_lib)
 
         # 话题/坐标系参数（右手）
-        self.declare_parameter('input_topic', 'tracking/points3d')
-        self.declare_parameter('source_frame', 'right_camera_color_optical_frame')
-        self.declare_parameter('wrist_frame', 'joint_r7_wrist_roll')
-        self.declare_parameter('target_frame', 'link_r0_arm_base')
+        default_input_topic = self.config.get('frames', {}).get('input_topic', 'tracking/points3d')
+        default_source_frame = self.config.get('frames', {}).get('source_frame', 'right_camera_color_optical_frame')
+        default_wrist_frame = self.config.get('frames', {}).get('wrist_frame', 'joint_r7_wrist_roll')
+        default_target_frame = self.config.get('frames', {}).get('target_frame', 'link_r0_arm_base')
+        self.declare_parameter('input_topic', default_input_topic)
+        self.declare_parameter('source_frame', default_source_frame)
+        self.declare_parameter('wrist_frame', default_wrist_frame)
+        self.declare_parameter('target_frame', default_target_frame)
         self.declare_parameter('publish_transformed', True)
         self.declare_parameter('print_limit', 10)
         # 粗定位控制参数
-        self.declare_parameter('enable_coarse_move', True)
-        self.declare_parameter('component_type', 1)  # 1: 左臂  2: 右臂
-        self.declare_parameter('distance_stop', 0.5)  # m
-        self.declare_parameter('step_size', 0.08)     # 每步前进距离 m
-        self.declare_parameter('cmd_interval', 0.3)   # 连续set_arm_position发送最小间隔 s（当wait=False）
-        self.declare_parameter('max_speed', 0.10)     # m/s
-        self.declare_parameter('max_acc', 0.15)       # m/s^2
-        self.declare_parameter('use_wait', False)     # set_arm_position 的 wait
-        self.declare_parameter('target_id', -1)       # 若>=0，则优先匹配channel 'id'
+        default_enable_coarse_move = self.config.get('control', {}).get('enable_coarse_move', True)
+        default_component_type = self.config.get('robot', {}).get('component_type', 1)
+        self.declare_parameter('enable_coarse_move', default_enable_coarse_move)
+        self.declare_parameter('component_type', default_component_type)  # 1: 左臂  2: 右臂
+        default_distance_stop = self.config.get('control', {}).get('distance_stop', 0.5)
+        default_step_size = self.config.get('control', {}).get('step_size', 0.08)
+        default_cmd_interval = self.config.get('control', {}).get('cmd_interval', 0.3)
+        default_max_speed = self.config.get('control', {}).get('max_speed', 0.10)
+        default_max_acc = self.config.get('control', {}).get('max_acc', 0.15)
+        default_use_wait = self.config.get('control', {}).get('use_wait', False)
+        default_target_id = self.config.get('control', {}).get('target_id', -1)
+        self.declare_parameter('distance_stop', default_distance_stop)  # m
+        self.declare_parameter('step_size', default_step_size)     # 每步前进距离 m
+        self.declare_parameter('cmd_interval', default_cmd_interval)   # 连续set_arm_position发送最小间隔 s（当wait=False）
+        self.declare_parameter('max_speed', default_max_speed)     # m/s
+        self.declare_parameter('max_acc', default_max_acc)       # m/s^2
+        self.declare_parameter('use_wait', default_use_wait)     # set_arm_position 的 wait
+        self.declare_parameter('target_id', default_target_id)       # 若>=0，则优先匹配channel 'id'
         # 外参文件 + 方向 + 坐标系约定
         ws_root = self._get_workspace_root()
-        default_extrinsic = os.path.join(ws_root, 'config', 'joint_lt_sensor_rgbd_12.txt') if ws_root else ''
+        config_extrinsic = self.config.get('extrinsics', {}).get('wrist_extrinsic_file', 'config/joint_lt_sensor_rgbd_12.txt')
+        default_extrinsic = os.path.join(ws_root, config_extrinsic) if ws_root else ''
         self.declare_parameter('wrist_extrinsic_file', default_extrinsic)
         self.declare_parameter('invert_extrinsic', False)  # 若文件给的是 T_{source<-wrist}，则置 True 取逆
         # 若外参以相机笛卡尔坐标（x前,y左,z上）为源，而输入为光学坐标（x右,y下,z前），需先做 optical->camera 固定旋转

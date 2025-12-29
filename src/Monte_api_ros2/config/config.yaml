@@ -1,0 +1,29 @@
+# Monte_api_ros2 配置文件
+# 用于配置机器人相关的参数
+
+# 机器人连接参数
+robot:
+  ip: "192.168.22.112:50051"  # 机器人IP地址和端口
+  component_type: 1  # 1: 左臂, 2: 右臂
+
+# 外参文件路径（相对于工作空间根目录）
+extrinsics:
+  wrist_extrinsic_file: "config/joint_lt_sensor_rgbd_12.txt"
+
+# 坐标系配置
+frames:
+  input_topic: "tracking/points3d"                  # 输入话题
+  source_frame: "left_camera_color_optical_frame"  # 源坐标系（相机光学坐标系）
+  wrist_frame: "joint_l7_wrist_roll"               # 腕关节坐标系
+  target_frame: "link_l0_arm_base"                  # 目标坐标系（基座坐标系）
+
+# 其他配置
+control:
+  enable_coarse_move: true
+  distance_stop: 0.5  # 停止距离（米）
+  step_size: 0.08     # 步进距离（米）
+  cmd_interval: 0.3   # 命令间隔（秒）
+  max_speed: 0.10     # 最大速度（m/s）
+  max_acc: 0.15       # 最大加速度（m/s^2）
+  use_wait: false     # 是否等待执行完成
+  target_id: -1       # 目标ID

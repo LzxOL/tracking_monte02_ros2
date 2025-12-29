@@ -24,6 +24,7 @@ from geometry_msgs.msg import Point32
 from std_msgs.msg import Header, Bool
 import matplotlib.pyplot as plt
 import re
+import yaml
 
 #############################
 # 路径搜索 tracking_module
@@ -153,11 +154,47 @@ def _init_robot_arm_servo(robot_ip: str, robot_lib_path: str, component_type: in
 
 class TrackCameraFrontMinNode(Node):
 
+    def _load_config(self):
+        """加载配置文件"""
+        # 获取包路径
+        try:
+            from ament_index_python.packages import get_package_share_directory
+            package_path = get_package_share_directory('track_on_ros2')
+            config_file = os.path.join(package_path, 'config', 'config.yaml')
+        except Exception:
+            # 如果找不到包路径，使用相对路径
+            current_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            config_file = os.path.join(current_dir, 'config', 'config.yaml')
+
+        if not os.path.exists(config_file):
+            self.get_logger().error(f'配置文件不存在: {config_file}')
+            return None
+
+        try:
+            with open(config_file, 'r', encoding='utf-8') as f:
+                config = yaml.safe_load(f)
+            self.get_logger().info(f'成功加载配置文件: {config_file}')
+            return config
+        except Exception as e:
+            self.get_logger().error(f'加载配置文件失败: {e}')
+            return None
+
     def __init__(self):
         super().__init__('track_camera_front_min_node')
 
+        # 加载配置文件
+        self.config = self._load_config()
+        if self.config is None:
+            self.get_logger().error('无法加载配置文件，使用默认参数')
+            self.config = {}
+
         ######## 机器人初始化参数（在最开始） ########
-        self.declare_parameter('robot_ip', '192.168.22.63:50051')
+        # 从配置文件读取机器人参数默认值
+        default_robot_ip = self.config.get('robot', {}).get('ip', '192.168.22.63:50051')
+        default_robot_component_type = self.config.get('robot', {}).get('component_type', 2)
+        default_init_robot_arm = self.config.get('robot', {}).get('init_robot_arm', True)
+
+        self.declare_parameter('robot_ip', default_robot_ip)
         try:
             from ament_index_python.packages import get_package_share_directory  # type: ignore
             default_lib = os.path.join(get_package_share_directory('Monte_api_ros2'), 'lib')
@@ -168,8 +205,8 @@ class TrackCameraFrontMinNode(Node):
                 'src', 'Monte_api_ros2', 'lib'
             )
         self.declare_parameter('robot_lib_path', default_lib)
-        self.declare_parameter('robot_component_type', 2)  # 1: 左臂, 2: 右臂
-        self.declare_parameter('init_robot_arm', True)  # 是否初始化机器人手臂
+        self.declare_parameter('robot_component_type', default_robot_component_type)  # 1: 左臂, 2: 右臂
+        self.declare_parameter('init_robot_arm', default_init_robot_arm)  # 是否初始化机器人手臂
 
         # 读取机器人参数
         robot_ip = self.get_parameter('robot_ip').value
@@ -189,19 +226,50 @@ class TrackCameraFrontMinNode(Node):
                 self.get_logger().warn("机器人手臂初始化失败，继续运行但无法控制手臂")
             self.get_logger().info("=" * 50)
 
+        # 根据配置文件确定相机配置
+        camera_selection = self.config.get('camera', {}).get('selection', 1)
+        if camera_selection == 1:
+            camera_config = self.config.get('left_camera', {})
+            camera_name = "左相机"
+        elif camera_selection == 2:
+            camera_config = self.config.get('right_camera', {})
+            camera_name = "右相机"
+        else:
+            self.get_logger().warn(f"未知的相机选择: {camera_selection}，使用默认配置")
+            camera_config = self.config.get('right_camera', {})
+            camera_name = "右相机（默认）"
+
+        self.get_logger().info(f"使用{camera_name}配置")
+
+        # 根据相机选择设置frame_id
+        if camera_selection == 1:
+            self.camera_frame_id = "left_camera_color_optical_frame"
+        else:
+            self.camera_frame_id = "right_camera_color_optical_frame"
+
+        # 从配置文件读取默认值
+        default_checkpoint = self.config.get('tracking', {}).get('checkpoint_path', '')
+        default_camera_topic = camera_config.get('camera_topic', '/right/color/video')
+        default_publish_visualization = self.config.get('tracking', {}).get('publish_visualization', True)
+        default_show_interactive_window = self.config.get('tracking', {}).get('show_interactive_window', True)
+
         ######## 参数 ########
-        self.declare_parameter('checkpoint_path', '')
-        self.declare_parameter('camera_topic', '')
-        self.declare_parameter('publish_visualization', True)
-        self.declare_parameter('show_interactive_window', True)
+        self.declare_parameter('checkpoint_path', default_checkpoint)
+        self.declare_parameter('camera_topic', default_camera_topic)
+        self.declare_parameter('publish_visualization', default_publish_visualization)
+        self.declare_parameter('show_interactive_window', default_show_interactive_window)
 
         # 3D 相关
-        # 默认从指定文件读取相机内参（像素单位）
-        # 获取工作空间根目录
+        # 根据相机选择设置内参文件和深度话题
         ws_root = self._get_workspace_root()
-        default_intrinsics = os.path.join(ws_root, 'config', 'camera_rhead_front_intrinsics_02_10.txt') if ws_root else ''
+        default_intrinsics = camera_config.get('intrinsics_file', 'config/camera_rhead_front_intrinsics_02_10.txt')
+        if ws_root and not os.path.isabs(default_intrinsics):
+            default_intrinsics = os.path.join(ws_root, default_intrinsics)
+
+        default_depth_topic = camera_config.get('depth_topic', '/right/depth/stream')
+
         self.declare_parameter('intrinsics_file', default_intrinsics)
-        self.declare_parameter('depth_topic', '/right/depth/stream')
+        self.declare_parameter('depth_topic', default_depth_topic)
         self.declare_parameter('depth_scale', 0.001)
         self.declare_parameter('print_3d', True)
         self.declare_parameter('print_3d_interval', 1)
@@ -733,7 +801,7 @@ class TrackCameraFrontMinNode(Node):
             pc = PointCloud()
             pc.header = Header()
             pc.header.stamp = header.stamp
-            pc.header.frame_id = "right_camera_color_optical_frame"
+            pc.header.frame_id = self.camera_frame_id
 
             pts = []
             ids = []
@@ -1032,7 +1100,7 @@ class TrackCameraFrontMinNode(Node):
                 pc = PointCloud()
                 pc.header = Header()
                 pc.header.stamp = kp_msg.header.stamp
-                pc.header.frame_id = "right_camera_color_optical_frame"
+                pc.header.frame_id = self.camera_frame_id
                 if Z is not None and all(v is not None for v in [self.fx, self.fy, self.cx, self.cy]):
                     X = (float(x) - self.cx) / self.fx * Z
                     Y = (float(y) - self.cy) / self.fy * Z
